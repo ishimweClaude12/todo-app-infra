@@ -5,7 +5,7 @@ parameters:
   ProjectName: todo-app
   # Prefix in the artifact bucket holding the nested templates. Managed by
   # scripts/publish-templates.sh (run by the publish-templates workflow).
-  TemplatesPrefix: infra-templates/v1
+  TemplatesPrefix: infra-templates/794cec380e62
   # "true" adds a standby database in the second AZ (HA, roughly double cost).
   DBMultiAZ: "false"
   # "true" runs a Redis replica in the second AZ with automatic failover.
