@@ -1,0 +1,50 @@
+name: publish-templates
+
+# Git sync deploys only the root template and does not package nested stacks,
+# so every nested template must already be in S3. This workflow validates and
+# uploads them under a content-hash prefix, then commits the new prefix to the
+# deployment file, which is what triggers Git sync to deploy.
+on:
+  push:
+    branches: [main]
+    paths: ["templates/**", "scripts/publish-templates.sh"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # commit the updated deployment file back to main
+  id-token: write # GitHub OIDC -> AWS, no stored keys
+
+concurrency:
+  group: publish-templates
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      AWS_REGION: us-east-1
+      PROJECT: todo-app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # ARN of todo-app-infra-ci-role (see iam/ and the README).
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate and publish nested templates
+        run: bash scripts/publish-templates.sh
+
+      - name: Commit the new TemplatesPrefix
+        run: |
+          if git diff --quiet -- .cfn/infrastructure.deployment.yaml; then
+            echo "Templates unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .cfn/infrastructure.deployment.yaml
+          git commit -m "chore: publish nested templates ($(grep TemplatesPrefix .cfn/infrastructure.deployment.yaml | awk '{print $2}'))"
+          git push

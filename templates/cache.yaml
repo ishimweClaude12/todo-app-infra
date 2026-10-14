@@ -1,0 +1,73 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Todo App cache layer: an ElastiCache for Redis replication group in the
+  dedicated cache subnets with its own security group. Encrypted at rest and
+  in transit, protected by the AUTH token generated in the foundation stack.
+  Two nodes with automatic Multi-AZ failover by default.
+
+Parameters:
+  ProjectName:
+    Type: String
+  CacheSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  CacheSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  RedisSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  RedisAuthSecretArn:
+    Type: String
+    Description: Foundation secret whose SecretString is the Redis AUTH token.
+  RedisNodeType:
+    Type: String
+    Default: cache.t3.micro
+    AllowedValues: [cache.t3.micro, cache.t3.small, cache.t4g.micro, cache.t4g.small]
+  RedisEngineVersion:
+    Type: String
+    Default: '7.1'
+  RedisMultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: true runs a primary plus a replica in the other AZ with automatic failover.
+
+Conditions:
+  IsMultiAZ: !Equals [!Ref RedisMultiAZ, 'true']
+
+Resources:
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub '${ProjectName}-cache-subnets'
+      Description: Dedicated cache-tier subnets for Redis.
+      SubnetIds: [!Ref CacheSubnet1Id, !Ref CacheSubnet2Id]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-cache-subnets' }
+
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub '${ProjectName}-redis'
+      ReplicationGroupDescription: Todo App read cache (cache-aside).
+      Engine: redis
+      EngineVersion: !Ref RedisEngineVersion
+      CacheNodeType: !Ref RedisNodeType
+      Port: 6379
+      NumCacheClusters: !If [IsMultiAZ, 2, 1]
+      AutomaticFailoverEnabled: !If [IsMultiAZ, true, false]
+      MultiAZEnabled: !If [IsMultiAZ, true, false]
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds: [!Ref RedisSecurityGroupId]
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      AuthToken: !Sub '{{resolve:secretsmanager:${RedisAuthSecretArn}:SecretString}}'
+      AutoMinorVersionUpgrade: true
+      # The cache is rebuilt from the database on a miss; no backups needed.
+      SnapshotRetentionLimit: 0
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-redis' }
+
+Outputs:
+  RedisPrimaryEndpoint:
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
+  RedisPort:
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Port

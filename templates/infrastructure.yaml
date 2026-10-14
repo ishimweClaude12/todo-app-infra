@@ -1,0 +1,307 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Todo App infrastructure root stack (deployed via CloudFormation Git sync).
+  Owns only wiring: reads the foundation exports, creates one nested stack per
+  layer and passes values between them.
+
+# Layers, in dependency order:
+#   network.yaml          VPC; public, app, data, proxy and cache subnets
+#   security-groups.yaml  one SG per resource: ALB, ECS, RDS Proxy, RDS, Redis, endpoints
+#   vpc-endpoints.yaml    S3 gateway + ECR api/dkr, Logs, Secrets Manager interfaces
+#   load-balancer.yaml    ALB, blue/green target groups, HTTP listener
+#   database.yaml         RDS PostgreSQL + RDS Proxy
+#   cache.yaml            ElastiCache for Redis
+#   iam.yaml              runtime and delivery roles, CI read access to the contract
+#   compute.yaml          log group, ECS cluster, task definition, service, autoscaling
+#   delivery.yaml         CodeDeploy, CodePipeline, EventBridge trigger
+#   ssm-parameters.yaml   the /<ProjectName>/deploy/* contract for the app repo
+# Edit a layer in its own file; edit this file only to add a layer or change
+# how layers connect.
+
+# ---------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: todo-app
+    Description: Prefix used to name resources. Must match the foundation stack's ProjectName.
+  TemplatesPrefix:
+    Type: String
+    Default: infra-templates/v1
+    Description: >
+      Key prefix in the foundation artifact bucket where the nested templates
+      were published by scripts/publish-templates.sh. It is a content hash, so
+      it changes whenever a nested template changes.
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: ECR tag the service bootstraps from and the pipeline tracks.
+  ContainerPort:
+    Type: Number
+    Default: 3000
+  ContainerCpu:
+    Type: String
+    Default: '256'
+    AllowedValues: ['256', '512', '1024', '2048']
+  ContainerMemory:
+    Type: String
+    Default: '512'
+  DesiredCount:
+    Type: Number
+    Default: 1
+  MinCount:
+    Type: Number
+    Default: 1
+  MaxCount:
+    Type: Number
+    Default: 4
+  CpuTargetValue:
+    Type: Number
+    Default: 60
+    Description: Target average CPU percentage for autoscaling.
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+  DBMultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: true adds a standby database instance in the second AZ.
+  RedisNodeType:
+    Type: String
+    Default: cache.t3.micro
+    AllowedValues: [cache.t3.micro, cache.t3.small, cache.t4g.micro, cache.t4g.small]
+  RedisMultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: true runs a Redis replica in the second AZ with automatic failover.
+
+# ---------------------------------------------------------------------------
+Resources:
+
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/network.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        VpcCidr: !Ref VpcCidr
+      Tags:
+        - { Key: Layer, Value: network }
+
+  SecurityGroupStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/security-groups.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        ContainerPort: !Ref ContainerPort
+      Tags:
+        - { Key: Layer, Value: security-groups }
+
+  VpcEndpointStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/vpc-endpoints.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        AppSubnet1Id: !GetAtt NetworkStack.Outputs.AppSubnet1Id
+        AppSubnet2Id: !GetAtt NetworkStack.Outputs.AppSubnet2Id
+        AppRouteTableId: !GetAtt NetworkStack.Outputs.AppRouteTableId
+        SecurityGroupId: !GetAtt SecurityGroupStack.Outputs.VpcEndpointSecurityGroupId
+      Tags:
+        - { Key: Layer, Value: vpc-endpoints }
+
+  LoadBalancerStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/load-balancer.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        PublicSubnet1Id: !GetAtt NetworkStack.Outputs.PublicSubnet1Id
+        PublicSubnet2Id: !GetAtt NetworkStack.Outputs.PublicSubnet2Id
+        AlbSecurityGroupId: !GetAtt SecurityGroupStack.Outputs.AlbSecurityGroupId
+        ContainerPort: !Ref ContainerPort
+      Tags:
+        - { Key: Layer, Value: load-balancer }
+
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    # RDS Proxy fetches the DB secret through the Secrets Manager endpoint.
+    DependsOn: VpcEndpointStack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/database.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        DataSubnet1Id: !GetAtt NetworkStack.Outputs.DataSubnet1Id
+        DataSubnet2Id: !GetAtt NetworkStack.Outputs.DataSubnet2Id
+        ProxySubnet1Id: !GetAtt NetworkStack.Outputs.ProxySubnet1Id
+        ProxySubnet2Id: !GetAtt NetworkStack.Outputs.ProxySubnet2Id
+        RdsSecurityGroupId: !GetAtt SecurityGroupStack.Outputs.RdsSecurityGroupId
+        RdsProxySecurityGroupId: !GetAtt SecurityGroupStack.Outputs.RdsProxySecurityGroupId
+        DBSecretArn: { 'Fn::ImportValue': !Sub '${ProjectName}-db-secret-arn' }
+        DBName: { 'Fn::ImportValue': !Sub '${ProjectName}-db-name' }
+        RdsProxyRoleArn: { 'Fn::ImportValue': !Sub '${ProjectName}-rds-proxy-role-arn' }
+        DBInstanceClass: !Ref DBInstanceClass
+        DBMultiAZ: !Ref DBMultiAZ
+      Tags:
+        - { Key: Layer, Value: database }
+
+  CacheStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/cache.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        CacheSubnet1Id: !GetAtt NetworkStack.Outputs.CacheSubnet1Id
+        CacheSubnet2Id: !GetAtt NetworkStack.Outputs.CacheSubnet2Id
+        RedisSecurityGroupId: !GetAtt SecurityGroupStack.Outputs.RedisSecurityGroupId
+        RedisAuthSecretArn: { 'Fn::ImportValue': !Sub '${ProjectName}-redis-auth-secret-arn' }
+        RedisNodeType: !Ref RedisNodeType
+        RedisMultiAZ: !Ref RedisMultiAZ
+      Tags:
+        - { Key: Layer, Value: cache }
+
+  IamStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/iam.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        DBSecretArn: { 'Fn::ImportValue': !Sub '${ProjectName}-db-secret-arn' }
+        RedisAuthSecretArn: { 'Fn::ImportValue': !Sub '${ProjectName}-redis-auth-secret-arn' }
+        ArtifactBucketArn: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-arn' }
+        EcrRepositoryArn: { 'Fn::ImportValue': !Sub '${ProjectName}-ecr-arn' }
+        # Role created by the foundation stack (RoleName ${ProjectName}-ci-role).
+        CiRoleName: !Sub '${ProjectName}-ci-role'
+        # Named, not referenced, so IAM does not depend on DeliveryStack.
+        PipelineName: !Sub '${ProjectName}-pipeline'
+      Tags:
+        - { Key: Layer, Value: iam }
+
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    # Tasks pull the image and secrets through the endpoints, which nothing in
+    # the parameters below references.
+    DependsOn: VpcEndpointStack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/compute.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        ContainerImageUri: !Sub
+          - '${Uri}:${ImageTag}'
+          - Uri: { 'Fn::ImportValue': !Sub '${ProjectName}-ecr-uri' }
+        ContainerCpu: !Ref ContainerCpu
+        ContainerMemory: !Ref ContainerMemory
+        ContainerPort: !Ref ContainerPort
+        DesiredCount: !Ref DesiredCount
+        MinCount: !Ref MinCount
+        MaxCount: !Ref MaxCount
+        CpuTargetValue: !Ref CpuTargetValue
+        AppSubnet1Id: !GetAtt NetworkStack.Outputs.AppSubnet1Id
+        AppSubnet2Id: !GetAtt NetworkStack.Outputs.AppSubnet2Id
+        EcsSecurityGroupId: !GetAtt SecurityGroupStack.Outputs.EcsSecurityGroupId
+        BlueTargetGroupArn: !GetAtt LoadBalancerStack.Outputs.BlueTargetGroupArn
+        TaskExecutionRoleArn: !GetAtt IamStack.Outputs.TaskExecutionRoleArn
+        TaskRoleArn: !GetAtt IamStack.Outputs.TaskRoleArn
+        DBProxyEndpoint: !GetAtt DatabaseStack.Outputs.DBProxyEndpoint
+        DBName: { 'Fn::ImportValue': !Sub '${ProjectName}-db-name' }
+        DBUsername: { 'Fn::ImportValue': !Sub '${ProjectName}-db-username' }
+        DBSecretArn: { 'Fn::ImportValue': !Sub '${ProjectName}-db-secret-arn' }
+        RedisEndpoint: !GetAtt CacheStack.Outputs.RedisPrimaryEndpoint
+        RedisAuthSecretArn: { 'Fn::ImportValue': !Sub '${ProjectName}-redis-auth-secret-arn' }
+      Tags:
+        - { Key: Layer, Value: compute }
+
+  DeliveryStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/delivery.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        ImageTag: !Ref ImageTag
+        ClusterName: !GetAtt ComputeStack.Outputs.ClusterName
+        ServiceName: !GetAtt ComputeStack.Outputs.ServiceName
+        HttpListenerArn: !GetAtt LoadBalancerStack.Outputs.HttpListenerArn
+        BlueTargetGroupName: !GetAtt LoadBalancerStack.Outputs.BlueTargetGroupName
+        GreenTargetGroupName: !GetAtt LoadBalancerStack.Outputs.GreenTargetGroupName
+        ArtifactBucketName: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+        EcrRepositoryName: { 'Fn::ImportValue': !Sub '${ProjectName}-ecr-name' }
+        CodeDeployRoleArn: !GetAtt IamStack.Outputs.CodeDeployRoleArn
+        PipelineRoleArn: !GetAtt IamStack.Outputs.PipelineRoleArn
+        EventBridgeRoleArn: !GetAtt IamStack.Outputs.EventBridgeRoleArn
+      Tags:
+        - { Key: Layer, Value: delivery }
+
+  SsmParameterStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${Bucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/ssm-parameters.yaml'
+        - Bucket: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Parameters:
+        ProjectName: !Ref ProjectName
+        TaskExecutionRoleArn: !GetAtt IamStack.Outputs.TaskExecutionRoleArn
+        TaskRoleArn: !GetAtt IamStack.Outputs.TaskRoleArn
+        LogGroupName: !GetAtt ComputeStack.Outputs.LogGroupName
+        DBProxyEndpoint: !GetAtt DatabaseStack.Outputs.DBProxyEndpoint
+        DBSecretArn: { 'Fn::ImportValue': !Sub '${ProjectName}-db-secret-arn' }
+        RedisEndpoint: !GetAtt CacheStack.Outputs.RedisPrimaryEndpoint
+        RedisAuthSecretArn: { 'Fn::ImportValue': !Sub '${ProjectName}-redis-auth-secret-arn' }
+        ArtifactBucketName: { 'Fn::ImportValue': !Sub '${ProjectName}-artifact-bucket-name' }
+      Tags:
+        - { Key: Layer, Value: ssm-parameters }
+
+# ---------------------------------------------------------------------------
+Outputs:
+  AlbEndpoint:
+    Description: Public URL of the running application (the deliverable endpoint).
+    Value: !Sub
+      - 'http://${Dns}'
+      - Dns: !GetAtt LoadBalancerStack.Outputs.LoadBalancerDnsName
+
+  DBProxyEndpoint:
+    Description: RDS Proxy endpoint the app connects to.
+    Value: !GetAtt DatabaseStack.Outputs.DBProxyEndpoint
+
+  RedisEndpoint:
+    Description: ElastiCache Redis primary endpoint.
+    Value: !GetAtt CacheStack.Outputs.RedisPrimaryEndpoint
+
+  EcsClusterName:
+    Value: !GetAtt ComputeStack.Outputs.ClusterName
+
+  EcsServiceName:
+    Value: !GetAtt ComputeStack.Outputs.ServiceName
+
+  LogGroupName:
+    Description: CloudWatch Logs group for the app containers.
+    Value: !GetAtt ComputeStack.Outputs.LogGroupName
+
+  PipelineName:
+    Value: !GetAtt DeliveryStack.Outputs.PipelineName

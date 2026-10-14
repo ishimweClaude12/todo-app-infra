@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  The /<ProjectName>/deploy/* contract. The application workflow
+  (todo-app-codes) reads these parameters to render deploy/taskdef.json and to
+  find the artifact bucket, so every value it needs is published here and
+  nowhere else.
+
+Parameters:
+  ProjectName:
+    Type: String
+  TaskExecutionRoleArn:
+    Type: String
+  TaskRoleArn:
+    Type: String
+  LogGroupName:
+    Type: String
+  DBProxyEndpoint:
+    Type: String
+  DBSecretArn:
+    Type: String
+  RedisEndpoint:
+    Type: String
+  RedisAuthSecretArn:
+    Type: String
+  ArtifactBucketName:
+    Type: String
+
+Resources:
+  SsmExecutionRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/deploy/execution-role-arn'
+      Type: String
+      Value: !Ref TaskExecutionRoleArn
+
+  SsmTaskRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/deploy/task-role-arn'
+      Type: String
+      Value: !Ref TaskRoleArn
+
+  SsmLogGroup:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/deploy/log-group'
+      Type: String
+      Value: !Ref LogGroupName
+
+  SsmDbProxyEndpoint:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/deploy/db-proxy-endpoint'
+      Type: String
+      Value: !Ref DBProxyEndpoint
+
+  SsmDbSecretArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/deploy/db-secret-arn'
+      Type: String
+      Value: !Ref DBSecretArn
+
+  SsmRedisEndpoint:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/deploy/redis-endpoint'
+      Type: String
+      Value: !Ref RedisEndpoint
+
+  SsmRedisAuthSecretArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/deploy/redis-auth-secret-arn'
+      Type: String
+      Value: !Ref RedisAuthSecretArn
+
+  SsmArtifactBucket:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/deploy/artifact-bucket'
+      Type: String
+      Value: !Ref ArtifactBucketName

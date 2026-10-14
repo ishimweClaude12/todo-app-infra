@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Todo App runtime and delivery IAM roles: the ECS task execution and task
+  roles, the CodeDeploy service role, the CodePipeline role and the EventBridge
+  role that starts the pipeline. It also grants the foundation's GitHub Actions
+  CI role read access to the /<ProjectName>/deploy/* parameters this stack
+  publishes, so that grant lives next to the parameters it covers.
+
+Parameters:
+  ProjectName:
+    Type: String
+  DBSecretArn:
+    Type: String
+    Description: RDS credentials secret; the tasks read the password from it.
+  RedisAuthSecretArn:
+    Type: String
+    Description: Redis AUTH token secret; the tasks read the token from it.
+  ArtifactBucketArn:
+    Type: String
+  EcrRepositoryArn:
+    Type: String
+  CiRoleName:
+    Type: String
+    Description: Name of the foundation's GitHub Actions OIDC role.
+  PipelineName:
+    Type: String
+    Description: >
+      Name of the pipeline EventBridge is allowed to start. Passed in rather
+      than referenced so this stack does not depend on the delivery stack.
+
+Resources:
+  # Used by the ECS agent: pull the image, write logs, inject the secrets.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: read-app-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DBSecretArn
+                  - !Ref RedisAuthSecretArn
+
+  # Assumed by the application code. The app makes no AWS API calls (it talks
+  # to RDS Proxy and Redis over the network), so it is granted nothing.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codedeploy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codedeploy.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSCodeDeployRoleForECS'
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ArtifactBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Ref ArtifactBucketArn
+                  - !Sub '${ArtifactBucketArn}/*'
+              - Sid: EcrSource
+                Effect: Allow
+                Action: ecr:DescribeImages
+                Resource: !Ref EcrRepositoryArn
+              - Sid: CodeDeploy
+                Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetDeploymentGroup
+                Resource: '*'
+              - Sid: EcsForCodeDeploy
+                Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:UpdateService
+                  - ecs:TagResource
+                Resource: '*'
+              - Sid: PassRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${PipelineName}'
+
+  # The app workflow reads the deploy contract from SSM and checks whether a
+  # SHA tag already exists in ECR. The foundation CI role has neither
+  # permission, because the parameters only exist once this stack does.
+  CiDeployContractPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-ci-read-deploy-contract'
+      Roles: [!Ref CiRoleName]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadDeployParameters
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/deploy/*'
+          - Sid: CheckExistingImageTags
+            Effect: Allow
+            Action: ecr:DescribeImages
+            Resource: !Ref EcrRepositoryArn
+
+Outputs:
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+  CodeDeployRoleArn:
+    Value: !GetAtt CodeDeployRole.Arn
+  PipelineRoleArn:
+    Value: !GetAtt PipelineRole.Arn
+  EventBridgeRoleArn:
+    Value: !GetAtt EventBridgeRole.Arn

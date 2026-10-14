@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Todo App VPC endpoints. They replace a NAT gateway: an S3 gateway endpoint
+  on the app route table (ECR image layers), plus interface endpoints in the
+  app subnets for ECR (api and dkr), CloudWatch Logs and Secrets Manager.
+
+Parameters:
+  ProjectName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  AppSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  AppSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  AppRouteTableId:
+    Type: String
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for the interface endpoints.
+
+Resources:
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref AppRouteTableId]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-s3-gateway' }
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnet1Id, !Ref AppSubnet2Id]
+      SecurityGroupIds: [!Ref SecurityGroupId]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-ecr-api' }
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnet1Id, !Ref AppSubnet2Id]
+      SecurityGroupIds: [!Ref SecurityGroupId]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-ecr-dkr' }
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnet1Id, !Ref AppSubnet2Id]
+      SecurityGroupIds: [!Ref SecurityGroupId]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-logs' }
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnet1Id, !Ref AppSubnet2Id]
+      SecurityGroupIds: [!Ref SecurityGroupId]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-secretsmanager' }

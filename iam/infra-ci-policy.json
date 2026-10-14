@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ResolveExportsAndValidateTemplates",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:ListExports",
+        "cloudformation:ValidateTemplate"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ListTemplatePrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::todo-app-artifacts-605134436600-us-east-1",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["infra-templates", "infra-templates/*"]
+        }
+      }
+    },
+    {
+      "Sid": "UploadNestedTemplates",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::todo-app-artifacts-605134436600-us-east-1/infra-templates/*"
+    }
+  ]
+}

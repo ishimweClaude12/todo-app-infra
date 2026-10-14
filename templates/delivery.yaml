@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Todo App delivery chain: the CodeDeploy application and ECS blue/green
+  deployment group, the CodePipeline (S3 config source plus ECR image source,
+  then a CodeDeployToECS deploy), and the EventBridge rule that starts the
+  pipeline when a new image is pushed to ECR.
+
+Parameters:
+  ProjectName:
+    Type: String
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: ECR tag the pipeline tracks.
+  ClusterName:
+    Type: String
+  ServiceName:
+    Type: String
+  HttpListenerArn:
+    Type: String
+  BlueTargetGroupName:
+    Type: String
+  GreenTargetGroupName:
+    Type: String
+  ArtifactBucketName:
+    Type: String
+  EcrRepositoryName:
+    Type: String
+  CodeDeployRoleArn:
+    Type: String
+  PipelineRoleArn:
+    Type: String
+  EventBridgeRoleArn:
+    Type: String
+  ConfigSourceObjectKey:
+    Type: String
+    Default: config-source.zip
+    Description: Deploy bundle the application workflow uploads to the artifact bucket.
+  BlueTerminationWaitMinutes:
+    Type: Number
+    Default: 5
+    Description: How long the old (blue) tasks stay up after traffic shifts, for instant rollback.
+
+Resources:
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-cd-app'
+      ComputePlatform: ECS
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-cd-app' }
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub '${ProjectName}-dg'
+      ServiceRoleArn: !Ref CodeDeployRoleArn
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: !Ref BlueTerminationWaitMinutes
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_REQUEST]
+      ECSServices:
+        - ClusterName: !Ref ClusterName
+          ServiceName: !Ref ServiceName
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups:
+              - Name: !Ref BlueTargetGroupName
+              - Name: !Ref GreenTargetGroupName
+            ProdTrafficRoute:
+              ListenerArns: [!Ref HttpListenerArn]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-dg' }
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline'
+      RoleArn: !Ref PipelineRoleArn
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucketName
+      Stages:
+        - Name: Source
+          Actions:
+            # Read on every run, never polled: the run is started by the ECR
+            # push rule below, after the workflow has uploaded the bundle.
+            - Name: ConfigSource
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: S3, Version: '1' }
+              Configuration:
+                S3Bucket: !Ref ArtifactBucketName
+                S3ObjectKey: !Ref ConfigSourceObjectKey
+                PollForSourceChanges: 'false'
+              OutputArtifacts: [{ Name: ConfigArtifact }]
+              RunOrder: 1
+            - Name: ImageSource
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: ECR, Version: '1' }
+              Configuration:
+                RepositoryName: !Ref EcrRepositoryName
+                ImageTag: !Ref ImageTag
+              OutputArtifacts: [{ Name: ImageArtifact }]
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: BlueGreenDeploy
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: CodeDeployToECS, Version: '1' }
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+                TaskDefinitionTemplateArtifact: ConfigArtifact
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: ConfigArtifact
+                AppSpecTemplatePath: appspec.yaml
+                Image1ArtifactName: ImageArtifact
+                Image1ContainerName: IMAGE1_NAME
+              InputArtifacts: [{ Name: ConfigArtifact }, { Name: ImageArtifact }]
+              RunOrder: 1
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-pipeline' }
+
+  EcrPushRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-ecr-push-rule'
+      Description: Start the pipeline when a new image tag is pushed to the app ECR repository.
+      EventPattern:
+        source: [aws.ecr]
+        detail-type: ['ECR Image Action']
+        detail:
+          action-type: [PUSH]
+          result: [SUCCESS]
+          repository-name: [!Ref EcrRepositoryName]
+          image-tag: [!Ref ImageTag]
+      State: ENABLED
+      Targets:
+        - Id: pipeline
+          Arn: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}'
+          RoleArn: !Ref EventBridgeRoleArn
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  CodeDeployApplicationName:
+    Value: !Ref CodeDeployApplication
+  DeploymentGroupName:
+    Value: !Ref CodeDeployDeploymentGroup

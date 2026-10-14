@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Todo App database layer: RDS PostgreSQL in the dedicated data subnets and an
+  RDS Proxy in the dedicated proxy subnets, each with its own security group.
+  The app only ever talks to the proxy, which pools connections and requires
+  TLS. Credentials come from the foundation stack's Secrets Manager secret, so
+  they survive a rebuild of this stack.
+
+Parameters:
+  ProjectName:
+    Type: String
+  DataSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  DataSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  ProxySubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  ProxySubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  RdsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  RdsProxySecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  DBSecretArn:
+    Type: String
+    Description: Foundation secret holding username, password and dbname.
+  DBName:
+    Type: String
+  RdsProxyRoleArn:
+    Type: String
+    Description: Foundation role RDS Proxy assumes to read DBSecretArn.
+  DBEngineVersion:
+    Type: String
+    Default: '16'
+    Description: PostgreSQL major version; RDS picks the current default minor.
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+  DBMultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set true for a standby replica in the second AZ.
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+
+Resources:
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnets'
+      DBSubnetGroupDescription: Dedicated data-tier subnets for the database.
+      SubnetIds: [!Ref DataSubnet1Id, !Ref DataSubnet2Id]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-db-subnets' }
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    # Lab setting: deleting the stack deletes the data. Use Snapshot to keep it.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-db'
+      Engine: postgres
+      EngineVersion: !Ref DBEngineVersion
+      AutoMinorVersionUpgrade: true
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: !Ref DBName
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DBSecretArn}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecretArn}:SecretString:password}}'
+      MultiAZ: !Ref DBMultiAZ
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSecurityGroupId]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      CopyTagsToSnapshot: true
+      EnableCloudwatchLogsExports: [postgresql]
+      DeletionProtection: false
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-db' }
+
+  DBProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Sub '${ProjectName}-proxy'
+      EngineFamily: POSTGRESQL
+      RoleArn: !Ref RdsProxyRoleArn
+      RequireTLS: true
+      IdleClientTimeout: 1800
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref DBSecretArn
+          IAMAuth: DISABLED
+          ClientPasswordAuthType: POSTGRES_SCRAM_SHA_256
+      VpcSubnetIds: [!Ref ProxySubnet1Id, !Ref ProxySubnet2Id]
+      VpcSecurityGroupIds: [!Ref RdsProxySecurityGroupId]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-proxy' }
+
+  DBProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref DBProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers: [!Ref DBInstance]
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 90
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 120
+
+Outputs:
+  DBInstanceEndpoint:
+    Description: Direct instance endpoint. The app never uses it; it goes through the proxy.
+    Value: !GetAtt DBInstance.Endpoint.Address
+  DBProxyEndpoint:
+    Value: !GetAtt DBProxy.Endpoint

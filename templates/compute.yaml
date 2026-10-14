@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Todo App compute layer: the log group, the ECS cluster, a bootstrap task
+  definition, the Fargate service (CODE_DEPLOY controller) in the dedicated app
+  subnets, and CPU target-tracking autoscaling (min 1 / desired 1 / max 4).
+  The pipeline registers a new task definition on every deploy; the bootstrap
+  one only exists so the service can be created and pass health checks on
+  first launch. It mirrors deploy/taskdef.json in the application repo.
+
+Parameters:
+  ProjectName:
+    Type: String
+  ContainerName:
+    Type: String
+    Default: todo-app
+    Description: Must match ContainerName in the app repo's appspec.yaml.
+  ContainerImageUri:
+    Type: String
+    Description: Fully qualified image URI including the tag.
+  ContainerCpu:
+    Type: String
+    Default: '256'
+    AllowedValues: ['256', '512', '1024', '2048']
+  ContainerMemory:
+    Type: String
+    Default: '512'
+  ContainerPort:
+    Type: Number
+    Default: 3000
+  DesiredCount:
+    Type: Number
+    Default: 1
+  MinCount:
+    Type: Number
+    Default: 1
+  MaxCount:
+    Type: Number
+    Default: 4
+  CpuTargetValue:
+    Type: Number
+    Default: 60
+    Description: Target average CPU percentage for autoscaling.
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+  AppSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  AppSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  EcsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  BlueTargetGroupArn:
+    Type: String
+  TaskExecutionRoleArn:
+    Type: String
+  TaskRoleArn:
+    Type: String
+  DBProxyEndpoint:
+    Type: String
+  DBName:
+    Type: String
+  DBUsername:
+    Type: String
+  DBSecretArn:
+    Type: String
+  RedisEndpoint:
+    Type: String
+  RedisAuthSecretArn:
+    Type: String
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-cluster' }
+
+  BootstrapTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ProjectName
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !Ref TaskExecutionRoleArn
+      TaskRoleArn: !Ref TaskRoleArn
+      ContainerDefinitions:
+        - Name: !Ref ContainerName
+          Image: !Ref ContainerImageUri
+          Essential: true
+          PortMappings:
+            - { ContainerPort: !Ref ContainerPort, Protocol: tcp }
+          Environment:
+            - { Name: PORT, Value: !Sub '${ContainerPort}' }
+            - { Name: DB_HOST, Value: !Ref DBProxyEndpoint }
+            - { Name: DB_PORT, Value: '5432' }
+            - { Name: DB_NAME, Value: !Ref DBName }
+            - { Name: DB_USER, Value: !Ref DBUsername }
+            - { Name: DB_SSL, Value: 'true' }
+            - { Name: REDIS_HOST, Value: !Ref RedisEndpoint }
+            - { Name: REDIS_PORT, Value: '6379' }
+            - { Name: REDIS_TLS, Value: 'true' }
+            - { Name: CACHE_TTL_SECONDS, Value: '60' }
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${DBSecretArn}:password::'
+            - Name: REDIS_PASSWORD
+              ValueFrom: !Ref RedisAuthSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref ContainerName
+
+  # With the CODE_DEPLOY controller, CloudFormation cannot change the task
+  # definition, load balancers or network config of this service after it is
+  # created; CodeDeploy owns them from then on.
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${ProjectName}-service'
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref BootstrapTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DeploymentController:
+        Type: CODE_DEPLOY
+      HealthCheckGracePeriodSeconds: 120
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref AppSubnet1Id, !Ref AppSubnet2Id]
+          SecurityGroups: [!Ref EcsSecurityGroupId]
+      LoadBalancers:
+        - ContainerName: !Ref ContainerName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref BlueTargetGroupArn
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-service' }
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinCount
+      MaxCapacity: !Ref MaxCount
+      ResourceId: !Sub 'service/${Cluster}/${Service.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-cpu-target-tracking'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: !Ref CpuTargetValue
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 120
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  LogGroupName:
+    Value: !Ref LogGroup

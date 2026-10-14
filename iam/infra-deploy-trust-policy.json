@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CfnGitSync",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudformation.sync.codeconnections.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "605134436600"
+        }
+      }
+    },
+    {
+      "Sid": "CloudFormationService",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudformation.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}

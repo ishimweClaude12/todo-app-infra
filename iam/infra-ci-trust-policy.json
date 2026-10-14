@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GitHubActionsInfraRepo",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::605134436600:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": [
+            "repo:ishimweClaude12/todo-app-infra:environment:dev",
+            "repo:ishimweClaude12/todo-app-infra:ref:refs/heads/main"
+          ]
+        }
+      }
+    }
+  ]
+}
